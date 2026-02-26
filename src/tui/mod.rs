@@ -7,6 +7,7 @@ use std::{
 	io,
 };
 
+use anyhow::{Context, bail};
 use crossterm::{
 	event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
 	execute,
@@ -214,7 +215,7 @@ fn handle_normal_key(handle: &IndexHandle, app: &mut App, code: KeyCode) -> anyh
 		},
 		KeyCode::Char('e') => {
 			if let Some(session) = app.selected_session()
-				&& let Some(path) = find_session_file(&session.session_id)
+				&& let Ok(path) = find_session_file(&session.session_id)
 			{
 				let _ = open_in_editor(path);
 			}
@@ -316,13 +317,13 @@ fn apply_message_filter(app: &mut App) {
 fn navigate_down(handle: &IndexHandle, app: &mut App) {
 	match app.active_pane {
 		Pane::Sessions => {
-			if !app.sessions.is_empty() && app.session_index < app.sessions.len() - 1 {
+			if app.session_index + 1 < app.sessions.len() {
 				app.session_index += 1;
 				let _ = load_session_messages(handle, app);
 			}
 		},
 		Pane::Messages => {
-			if !app.messages.is_empty() && app.message_index < app.messages.len() - 1 {
+			if app.message_index + 1 < app.messages.len() {
 				app.message_index += 1;
 				app.preview_scroll = 0;
 			}
@@ -358,13 +359,15 @@ fn page_down(handle: &IndexHandle, app: &mut App) {
 	match app.active_pane {
 		Pane::Sessions => {
 			if !app.sessions.is_empty() {
-				app.session_index = (app.session_index + half).min(app.sessions.len() - 1);
+				app.session_index =
+					(app.session_index + half).min(app.sessions.len().saturating_sub(1));
 				let _ = load_session_messages(handle, app);
 			}
 		},
 		Pane::Messages => {
 			if !app.messages.is_empty() {
-				app.message_index = (app.message_index + half).min(app.messages.len() - 1);
+				app.message_index =
+					(app.message_index + half).min(app.messages.len().saturating_sub(1));
 				app.preview_scroll = 0;
 			}
 		},
@@ -498,7 +501,7 @@ fn handle_filter_key(handle: &IndexHandle, app: &mut App, code: KeyCode) -> anyh
 
 	match code {
 		KeyCode::Char('j') | KeyCode::Down => {
-			if list_len > 0 && app.filter_index < list_len - 1 {
+			if app.filter_index + 1 < list_len {
 				app.filter_index += 1;
 			}
 		},
@@ -581,22 +584,27 @@ fn collect_filter_options(app: &mut App) {
 }
 
 /// Find the JSONL file for a session ID by scanning ~/.claude/projects/.
-fn find_session_file(session_id: &str) -> Option<std::path::PathBuf> {
-	let claude_dir = dirs::home_dir()?.join(".claude").join("projects");
+fn find_session_file(session_id: &str) -> anyhow::Result<std::path::PathBuf> {
+	let claude_dir = dirs::home_dir()
+		.context("could not determine home directory")?
+		.join(".claude")
+		.join("projects");
 	if !claude_dir.is_dir() {
-		return None;
+		bail!("projects directory not found: {}", claude_dir.display());
 	}
 	let filename = format!("{session_id}.jsonl");
-	for entry in std::fs::read_dir(&claude_dir).ok()? {
-		let entry = entry.ok()?;
-		if entry.file_type().ok()?.is_dir() {
+	for entry in std::fs::read_dir(&claude_dir)
+		.with_context(|| format!("failed to read {}", claude_dir.display()))?
+	{
+		let entry = entry?;
+		if entry.file_type()?.is_dir() {
 			let candidate = entry.path().join(&filename);
 			if candidate.exists() {
-				return Some(candidate);
+				return Ok(candidate);
 			}
 		}
 	}
-	None
+	bail!("session file not found for {session_id}");
 }
 
 /// Open a file in $EDITOR, suspending the TUI while the editor runs.

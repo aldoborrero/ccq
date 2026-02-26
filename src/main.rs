@@ -71,11 +71,11 @@ enum Commands {
 		#[arg(long)]
 		json: bool,
 		/// Show only the first N messages
-		#[arg(long, conflicts_with = "tail")]
-		head: Option<usize>,
+		#[arg(long, conflicts_with = "tail", value_parser = clap::value_parser!(u64).range(1..))]
+		head: Option<u64>,
 		/// Show only the last N messages
-		#[arg(long, conflicts_with = "head")]
-		tail: Option<usize>,
+		#[arg(long, conflicts_with = "head", value_parser = clap::value_parser!(u64).range(1..))]
+		tail: Option<u64>,
 	},
 	/// Show index statistics
 	Stats {
@@ -118,7 +118,14 @@ fn main() -> anyhow::Result<()> {
 		},
 		Commands::Sessions { session_id, project, json, head, tail } => {
 			let mut pager = pager::Pager::new(cli.no_pager || json);
-			crate::sessions::run_sessions(session_id, project, json, head, tail, pager.writer())?;
+			crate::sessions::run_sessions(
+				session_id,
+				project,
+				json,
+				head.map(|n| n as usize),
+				tail.map(|n| n as usize),
+				pager.writer(),
+			)?;
 		},
 		Commands::Stats { json } => {
 			crate::stats::run_stats(json)?;

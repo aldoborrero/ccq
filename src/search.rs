@@ -3,13 +3,14 @@ use std::io::Write;
 
 use anyhow::{Result, bail};
 use tantivy::{
-	DateTime, Index, TantivyDocument, Term,
+	Index, TantivyDocument, Term,
 	collector::TopDocs,
 	query::{QueryParser, TermQuery},
-	schema::{IndexRecordOption, Schema, Value},
+	schema::{IndexRecordOption, Schema},
 };
 
 use crate::{
+	doc::{self, SchemaFields},
 	index::{build_schema, index_dir},
 	tui::theme,
 };
@@ -51,33 +52,6 @@ struct SessionGroupJson {
 	latest_timestamp: String,
 }
 
-fn get_field_text(doc: &TantivyDocument, schema: &Schema, field_name: &str) -> String {
-	let field = schema.get_field(field_name).unwrap();
-	doc.get_first(field)
-		.and_then(|v| v.as_str())
-		.unwrap_or("")
-		.to_string()
-}
-
-fn get_field_date(doc: &TantivyDocument, schema: &Schema, field_name: &str) -> String {
-	let field = schema.get_field(field_name).unwrap();
-	doc.get_first(field)
-		.and_then(|v| v.as_datetime())
-		.map(|dt: DateTime| {
-			let utc = dt.into_utc();
-			format!(
-				"{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-				utc.year(),
-				utc.month() as u8,
-				utc.day(),
-				utc.hour(),
-				utc.minute(),
-				utc.second(),
-			)
-		})
-		.unwrap_or_default()
-}
-
 pub fn run_search(opts: SearchOptions, writer: &mut dyn Write) -> Result<()> {
 	let dir = index_dir();
 	if !dir.exists() || !dir.join("meta.json").exists() {
@@ -85,35 +59,30 @@ pub fn run_search(opts: SearchOptions, writer: &mut dyn Write) -> Result<()> {
 	}
 
 	let schema = build_schema();
+	let fields = SchemaFields::resolve(&schema)?;
 	let index = Index::open_in_dir(&dir)?;
 	let reader = index.reader()?;
 	let searcher = reader.searcher();
 
-	let content_field = schema.get_field("content").unwrap();
-	let query_parser = QueryParser::for_index(&index, vec![content_field]);
+	let query_parser = QueryParser::for_index(&index, vec![fields.content]);
 	let query = query_parser.parse_query(&opts.query)?;
 
 	let top_docs = searcher.search(&query, &TopDocs::with_limit(opts.limit))?;
 
 	let mut hits: Vec<SearchHit> = Vec::new();
 	for (score, doc_address) in top_docs {
-		let doc: TantivyDocument = searcher.doc(doc_address)?;
-
-		let session_id = get_field_text(&doc, &schema, "session_id");
-		let project_name = get_field_text(&doc, &schema, "project_name");
-		let git_branch = get_field_text(&doc, &schema, "git_branch");
-		let role = get_field_text(&doc, &schema, "role");
-		let timestamp = get_field_date(&doc, &schema, "timestamp");
-		let content = get_field_text(&doc, &schema, "content");
+		let d: TantivyDocument = searcher.doc(doc_address)?;
 
 		hits.push(SearchHit {
 			score,
-			session_id,
-			project_name,
-			git_branch,
-			role,
-			timestamp,
-			content,
+			session_id: doc::get_text(&d, fields.session_id),
+			project_name: doc::get_text(&d, fields.project_name),
+			git_branch: doc::get_text(&d, fields.git_branch),
+			role: doc::get_text(&d, fields.role),
+			timestamp: doc::get_datetime(&d, fields.timestamp)
+				.map(doc::format_datetime)
+				.unwrap_or_default(),
+			content: doc::get_text(&d, fields.content),
 		});
 	}
 
@@ -209,27 +178,29 @@ pub fn search_hits(query: &str, limit: usize) -> Result<Vec<SearchHit>> {
 	}
 
 	let schema = build_schema();
+	let fields = SchemaFields::resolve(&schema)?;
 	let index = Index::open_in_dir(&dir)?;
 	let reader = index.reader()?;
 	let searcher = reader.searcher();
 
-	let content_field = schema.get_field("content").unwrap();
-	let query_parser = QueryParser::for_index(&index, vec![content_field]);
+	let query_parser = QueryParser::for_index(&index, vec![fields.content]);
 	let parsed_query = query_parser.parse_query(query)?;
 
 	let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit))?;
 
 	let mut hits = Vec::new();
 	for (score, doc_address) in top_docs {
-		let doc: TantivyDocument = searcher.doc(doc_address)?;
+		let d: TantivyDocument = searcher.doc(doc_address)?;
 		hits.push(SearchHit {
 			score,
-			session_id: get_field_text(&doc, &schema, "session_id"),
-			project_name: get_field_text(&doc, &schema, "project_name"),
-			git_branch: get_field_text(&doc, &schema, "git_branch"),
-			role: get_field_text(&doc, &schema, "role"),
-			timestamp: get_field_date(&doc, &schema, "timestamp"),
-			content: get_field_text(&doc, &schema, "content"),
+			session_id: doc::get_text(&d, fields.session_id),
+			project_name: doc::get_text(&d, fields.project_name),
+			git_branch: doc::get_text(&d, fields.git_branch),
+			role: doc::get_text(&d, fields.role),
+			timestamp: doc::get_datetime(&d, fields.timestamp)
+				.map(doc::format_datetime)
+				.unwrap_or_default(),
+			content: doc::get_text(&d, fields.content),
 		});
 	}
 
@@ -248,6 +219,7 @@ pub fn all_sessions() -> Result<Vec<SessionInfo>> {
 	}
 
 	let schema = build_schema();
+	let fields = SchemaFields::resolve(&schema)?;
 	let index = Index::open_in_dir(&dir)?;
 	let reader = index.reader()?;
 	let searcher = reader.searcher();
@@ -257,14 +229,16 @@ pub fn all_sessions() -> Result<Vec<SessionInfo>> {
 	let mut groups: BTreeMap<String, (String, String, String, usize)> = BTreeMap::new();
 
 	for (_score, doc_address) in top_docs {
-		let doc: TantivyDocument = searcher.doc(doc_address)?;
-		let session_id = get_field_text(&doc, &schema, "session_id");
+		let d: TantivyDocument = searcher.doc(doc_address)?;
+		let session_id = doc::get_text(&d, fields.session_id);
 		if session_id.is_empty() {
 			continue;
 		}
-		let project_name = get_field_text(&doc, &schema, "project_name");
-		let git_branch = get_field_text(&doc, &schema, "git_branch");
-		let timestamp = get_field_date(&doc, &schema, "timestamp");
+		let project_name = doc::get_text(&d, fields.project_name);
+		let git_branch = doc::get_text(&d, fields.git_branch);
+		let timestamp = doc::get_datetime(&d, fields.timestamp)
+			.map(doc::format_datetime)
+			.unwrap_or_default();
 
 		let entry = groups
 			.entry(session_id)
@@ -304,22 +278,24 @@ pub fn session_messages(session_id: &str) -> Result<Vec<(String, String, String)
 	}
 
 	let schema = build_schema();
+	let fields = SchemaFields::resolve(&schema)?;
 	let index = Index::open_in_dir(&dir)?;
 	let reader = index.reader()?;
 	let searcher = reader.searcher();
 
-	let session_field = schema.get_field("session_id").unwrap();
-	let term = Term::from_field_text(session_field, session_id);
+	let term = Term::from_field_text(fields.session_id, session_id);
 	let term_query = TermQuery::new(term, IndexRecordOption::Basic);
 
 	let top_docs = searcher.search(&term_query, &TopDocs::with_limit(100_000))?;
 
 	let mut messages = Vec::new();
 	for (_score, doc_address) in top_docs {
-		let doc: TantivyDocument = searcher.doc(doc_address)?;
-		let timestamp = get_field_date(&doc, &schema, "timestamp");
-		let role = get_field_text(&doc, &schema, "role");
-		let content = get_field_text(&doc, &schema, "content");
+		let d: TantivyDocument = searcher.doc(doc_address)?;
+		let timestamp = doc::get_datetime(&d, fields.timestamp)
+			.map(doc::format_datetime)
+			.unwrap_or_default();
+		let role = doc::get_text(&d, fields.role);
+		let content = doc::get_text(&d, fields.content);
 		messages.push((timestamp, role, content));
 	}
 
@@ -421,8 +397,8 @@ fn fetch_context(
 	hit_role: &str,
 	context_size: usize,
 ) -> Result<Vec<(String, String, String)>> {
-	let session_field = schema.get_field("session_id").unwrap();
-	let term = Term::from_field_text(session_field, session_id);
+	let fields = SchemaFields::resolve(schema)?;
+	let term = Term::from_field_text(fields.session_id, session_id);
 	let term_query = TermQuery::new(term, IndexRecordOption::Basic);
 
 	// Collect all messages in this session (cap at a generous limit).
@@ -430,10 +406,12 @@ fn fetch_context(
 
 	let mut messages: Vec<(String, String, String)> = Vec::new();
 	for (_score, doc_address) in top_docs {
-		let doc: TantivyDocument = searcher.doc(doc_address)?;
-		let ts = get_field_date(&doc, schema, "timestamp");
-		let role = get_field_text(&doc, schema, "role");
-		let content = get_field_text(&doc, schema, "content");
+		let d: TantivyDocument = searcher.doc(doc_address)?;
+		let ts = doc::get_datetime(&d, fields.timestamp)
+			.map(doc::format_datetime)
+			.unwrap_or_default();
+		let role = doc::get_text(&d, fields.role);
+		let content = doc::get_text(&d, fields.content);
 		messages.push((ts, role, content));
 	}
 

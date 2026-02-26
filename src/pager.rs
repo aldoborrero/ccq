@@ -15,13 +15,6 @@ impl Pager {
 			};
 		}
 
-		// Set LESS default if not already set (same convention as git).
-		// SAFETY: This runs before spawning the pager child process and is
-		// single-threaded at this point in the CLI lifecycle.
-		if std::env::var("LESS").is_err() {
-			unsafe { std::env::set_var("LESS", "FRX") };
-		}
-
 		let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less -R".to_string());
 		let parts: Vec<&str> = pager_cmd.split_whitespace().collect();
 		let (program, args) = match parts.split_first() {
@@ -29,10 +22,16 @@ impl Pager {
 			None => ("less", ["-R"].as_slice()),
 		};
 
-		match Command::new(program)
-			.args(args)
-			.stdin(Stdio::piped())
-			.spawn()
+		let mut cmd = Command::new(program);
+		cmd.args(args).stdin(Stdio::piped());
+
+		// Set LESS default if not already set (same convention as git).
+		// Passed to the child process only — no global env mutation.
+		if std::env::var("LESS").is_err() {
+			cmd.env("LESS", "FRX");
+		}
+
+		match cmd.spawn()
 		{
 			Ok(mut child) => {
 				let stdin = child.stdin.take().expect("failed to open pager stdin");

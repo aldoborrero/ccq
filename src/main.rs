@@ -1,4 +1,5 @@
 mod discovery;
+mod doc;
 mod index;
 mod indexer;
 mod meta;

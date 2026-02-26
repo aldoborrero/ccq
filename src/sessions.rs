@@ -6,49 +6,14 @@ use tantivy::{
 	Index, Term,
 	collector::TopDocs,
 	query::{AllQuery, TermQuery},
-	schema::{Field, IndexRecordOption, OwnedValue, Schema},
+	schema::{IndexRecordOption, Schema},
 };
 
 use crate::{
+	doc::{self, SchemaFields},
 	index::{build_schema, index_dir},
 	tui::theme,
 };
-
-/// Extract a text field from a document, returning an empty string if missing.
-fn get_text(doc: &tantivy::TantivyDocument, field: Field) -> String {
-	match doc.get_first(field) {
-		Some(OwnedValue::Str(s)) => s.clone(),
-		_ => String::new(),
-	}
-}
-
-/// Extract a tantivy DateTime from a document, returning None if missing.
-fn get_datetime(doc: &tantivy::TantivyDocument, field: Field) -> Option<tantivy::DateTime> {
-	match doc.get_first(field) {
-		Some(OwnedValue::Date(dt)) => Some(*dt),
-		_ => None,
-	}
-}
-
-/// Format a tantivy DateTime for display using chrono.
-fn format_datetime(dt: tantivy::DateTime) -> String {
-	let secs = dt.into_timestamp_secs();
-	let chrono_dt = chrono::DateTime::from_timestamp(secs, 0);
-	match chrono_dt {
-		Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
-		None => "unknown".to_string(),
-	}
-}
-
-/// Format a tantivy DateTime as a date-only string.
-fn format_date(dt: tantivy::DateTime) -> String {
-	let secs = dt.into_timestamp_secs();
-	let chrono_dt = chrono::DateTime::from_timestamp(secs, 0);
-	match chrono_dt {
-		Some(t) => t.format("%Y-%m-%d").to_string(),
-		None => "unknown".to_string(),
-	}
-}
 
 /// Holds aggregated info about a session for listing.
 struct SessionInfo {
@@ -111,10 +76,7 @@ fn list_sessions(
 	json: bool,
 	writer: &mut dyn Write,
 ) -> Result<()> {
-	let f_session_id = schema.get_field("session_id").unwrap();
-	let f_project_name = schema.get_field("project_name").unwrap();
-	let f_git_branch = schema.get_field("git_branch").unwrap();
-	let f_timestamp = schema.get_field("timestamp").unwrap();
+	let fields = SchemaFields::resolve(schema)?;
 
 	let top_docs = TopDocs::with_limit(1_000_000);
 	let results = searcher
@@ -125,16 +87,16 @@ fn list_sessions(
 	let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
 
 	for (_score, doc_addr) in results {
-		let doc: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
+		let d: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
 
-		let sid = get_text(&doc, f_session_id);
+		let sid = doc::get_text(&d, fields.session_id);
 		if sid.is_empty() {
 			continue;
 		}
 
-		let pname = get_text(&doc, f_project_name);
-		let branch = get_text(&doc, f_git_branch);
-		let ts = get_datetime(&doc, f_timestamp);
+		let pname = doc::get_text(&d, fields.project_name);
+		let branch = doc::get_text(&d, fields.git_branch);
+		let ts = doc::get_datetime(&d, fields.timestamp);
 
 		// Apply project filter if provided.
 		if let Some(ref filter) = project
@@ -200,7 +162,7 @@ fn list_sessions(
 				project_name: info.project_name.clone(),
 				git_branch: info.git_branch.clone(),
 				date: match info.earliest {
-					Some(dt) => format_date(dt),
+					Some(dt) => doc::format_date(dt),
 					None => "unknown".to_string(),
 				},
 				message_count: info.count,
@@ -212,7 +174,7 @@ fn list_sessions(
 
 	for info in &session_list {
 		let date_str = match info.earliest {
-			Some(dt) => format_date(dt),
+			Some(dt) => doc::format_date(dt),
 			None => "unknown".to_string(),
 		};
 
@@ -254,10 +216,10 @@ fn resolve_session_id(
 	schema: &Schema,
 	input: &str,
 ) -> Result<String> {
-	let f_session_id = schema.get_field("session_id").unwrap();
+	let fields = SchemaFields::resolve(schema)?;
 
 	// First try an exact match.
-	let term = Term::from_field_text(f_session_id, input);
+	let term = Term::from_field_text(fields.session_id, input);
 	let query = TermQuery::new(term, IndexRecordOption::Basic);
 	let exact = searcher
 		.search(&query, &TopDocs::with_limit(1))
@@ -273,8 +235,8 @@ fn resolve_session_id(
 
 	let mut matches: HashMap<String, bool> = HashMap::new();
 	for (_score, doc_addr) in all_docs {
-		let doc: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
-		let sid = get_text(&doc, f_session_id);
+		let d: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
+		let sid = doc::get_text(&d, fields.session_id);
 		if sid.starts_with(input) {
 			matches.insert(sid, true);
 		}
@@ -303,15 +265,12 @@ fn show_session(
 	tail: Option<usize>,
 	writer: &mut dyn Write,
 ) -> Result<()> {
-	let f_session_id = schema.get_field("session_id").unwrap();
-	let f_role = schema.get_field("role").unwrap();
-	let f_timestamp = schema.get_field("timestamp").unwrap();
-	let f_content = schema.get_field("content").unwrap();
+	let fields = SchemaFields::resolve(schema)?;
 
 	// Resolve prefix to full session ID.
 	let full_sid = resolve_session_id(searcher, schema, session_id)?;
 
-	let term = Term::from_field_text(f_session_id, &full_sid);
+	let term = Term::from_field_text(fields.session_id, &full_sid);
 	let query = TermQuery::new(term, IndexRecordOption::Basic);
 
 	let top_docs = TopDocs::with_limit(1_000_000);
@@ -332,10 +291,10 @@ fn show_session(
 	let mut messages: Vec<(Option<tantivy::DateTime>, String, String)> = Vec::new();
 
 	for (_score, doc_addr) in results {
-		let doc: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
-		let role = get_text(&doc, f_role);
-		let content = get_text(&doc, f_content);
-		let ts = get_datetime(&doc, f_timestamp);
+		let d: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
+		let role = doc::get_text(&d, fields.role);
+		let content = doc::get_text(&d, fields.content);
+		let ts = doc::get_datetime(&d, fields.timestamp);
 		messages.push((ts, role, content));
 	}
 
@@ -367,7 +326,7 @@ fn show_session(
 			.iter()
 			.map(|(ts, role, content)| MessageJson {
 				timestamp: match ts {
-					Some(dt) => format_datetime(*dt),
+					Some(dt) => doc::format_datetime_short(*dt),
 					None => "unknown".to_string(),
 				},
 				role: role.clone(),
@@ -391,7 +350,7 @@ fn show_session(
 
 	for (ts, role, content) in &messages {
 		let ts_str = match ts {
-			Some(dt) => format_datetime(*dt),
+			Some(dt) => doc::format_datetime_short(*dt),
 			None => "unknown".to_string(),
 		};
 		writeln!(writer, "[{}] {}:", theme::styled_score(&ts_str), theme::styled_role(role))?;

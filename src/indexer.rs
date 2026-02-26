@@ -10,6 +10,7 @@ use tantivy::{DateTime, IndexWriter, schema::TantivyDocument};
 
 use crate::{
 	discovery::discover_sessions,
+	doc::SchemaFields,
 	index::{build_schema, delete_session, index_dir, open_or_create_index},
 	meta::IndexMeta,
 	parser::parse_line,
@@ -35,14 +36,7 @@ pub fn run_index(claude_dir: &Path, force: bool) -> Result<()> {
 		.context("failed to create index writer")?;
 
 	// Resolve schema fields once.
-	let f_id = schema.get_field("id").unwrap();
-	let f_project = schema.get_field("project").unwrap();
-	let f_project_name = schema.get_field("project_name").unwrap();
-	let f_session_id = schema.get_field("session_id").unwrap();
-	let f_git_branch = schema.get_field("git_branch").unwrap();
-	let f_role = schema.get_field("role").unwrap();
-	let f_timestamp = schema.get_field("timestamp").unwrap();
-	let f_content = schema.get_field("content").unwrap();
+	let fields = SchemaFields::resolve(&schema)?;
 
 	let mut indexed_sessions: u64 = 0;
 	let mut indexed_messages: u64 = 0;
@@ -75,14 +69,7 @@ pub fn run_index(claude_dir: &Path, force: bool) -> Result<()> {
 			&session.project_path,
 			&session.project_name,
 			&mut writer,
-			f_id,
-			f_project,
-			f_project_name,
-			f_session_id,
-			f_git_branch,
-			f_role,
-			f_timestamp,
-			f_content,
+			&fields,
 		)?;
 
 		indexed_sessions += 1;
@@ -122,21 +109,13 @@ pub fn run_index(claude_dir: &Path, force: bool) -> Result<()> {
 
 /// Index a single JSONL session file, adding one document per parsed
 /// message. Returns the number of messages successfully indexed.
-#[allow(clippy::too_many_arguments)]
 fn index_session_file(
 	path: &Path,
 	session_id: &str,
 	project_path: &str,
 	project_name: &str,
 	writer: &mut IndexWriter<TantivyDocument>,
-	f_id: tantivy::schema::Field,
-	f_project: tantivy::schema::Field,
-	f_project_name: tantivy::schema::Field,
-	f_session_id: tantivy::schema::Field,
-	f_git_branch: tantivy::schema::Field,
-	f_role: tantivy::schema::Field,
-	f_timestamp: tantivy::schema::Field,
-	f_content: tantivy::schema::Field,
+	fields: &SchemaFields,
 ) -> Result<u64> {
 	let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
 	let reader = BufReader::new(file);
@@ -181,14 +160,14 @@ fn index_session_file(
 		};
 
 		let mut doc = TantivyDocument::new();
-		doc.add_text(f_id, &parsed.message_uuid);
-		doc.add_text(f_project, &parsed.project);
-		doc.add_text(f_project_name, &parsed.project_name);
-		doc.add_text(f_session_id, &parsed.session_id);
-		doc.add_text(f_git_branch, &parsed.git_branch);
-		doc.add_text(f_role, &parsed.role);
-		doc.add_date(f_timestamp, tantivy_dt);
-		doc.add_text(f_content, &parsed.content);
+		doc.add_text(fields.id, &parsed.message_uuid);
+		doc.add_text(fields.project, &parsed.project);
+		doc.add_text(fields.project_name, &parsed.project_name);
+		doc.add_text(fields.session_id, &parsed.session_id);
+		doc.add_text(fields.git_branch, &parsed.git_branch);
+		doc.add_text(fields.role, &parsed.role);
+		doc.add_date(fields.timestamp, tantivy_dt);
+		doc.add_text(fields.content, &parsed.content);
 
 		writer.add_document(doc)?;
 		count += 1;

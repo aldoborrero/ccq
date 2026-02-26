@@ -3,10 +3,11 @@ use std::{collections::HashSet, fs, path::Path};
 use anyhow::{Context, Result, bail};
 use tantivy::{
 	Index,
-	schema::{Schema, TantivyDocument, Value},
+	schema::TantivyDocument,
 };
 
 use crate::{
+	doc::{self, SchemaFields},
 	index::{build_schema, index_dir},
 	meta::IndexMeta,
 	tui::theme,
@@ -25,6 +26,8 @@ pub fn run_stats(json: bool) -> Result<()> {
 	let reader = index.reader().context("failed to create index reader")?;
 	let searcher = reader.searcher();
 
+	let fields = SchemaFields::resolve(&schema)?;
+
 	let mut projects: HashSet<String> = HashSet::new();
 	let mut sessions: HashSet<String> = HashSet::new();
 	let mut total_messages: usize = 0;
@@ -41,12 +44,12 @@ pub fn run_stats(json: bool) -> Result<()> {
 				continue;
 			}
 
-			let doc: TantivyDocument = store_reader
+			let d: TantivyDocument = store_reader
 				.get(doc_id)
 				.context("failed to retrieve document from store")?;
 
-			let project_name = get_text(&doc, &schema, "project_name");
-			let session_id = get_text(&doc, &schema, "session_id");
+			let project_name = doc::get_text(&d, fields.project_name);
+			let session_id = doc::get_text(&d, fields.session_id);
 
 			if !project_name.is_empty() {
 				projects.insert(project_name);
@@ -114,15 +117,6 @@ pub fn run_stats(json: bool) -> Result<()> {
 	);
 
 	Ok(())
-}
-
-/// Extract a text field value from a TantivyDocument by field name.
-fn get_text(doc: &TantivyDocument, schema: &Schema, field: &str) -> String {
-	let f = schema.get_field(field).unwrap();
-	doc.get_first(f)
-		.and_then(|v| v.as_str())
-		.unwrap_or("")
-		.to_string()
 }
 
 /// Recursively compute the total size (in bytes) of all files under

@@ -18,6 +18,7 @@ ratatui = "0.29"
 unicode-width = "0.2"
 textwrap = "0.16"
 base64 = "0.22.1"
+ctrlc = "3.5.2"
 
 [profile.release]
 opt-level = 3

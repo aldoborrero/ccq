@@ -3,6 +3,10 @@ use std::{
 	fs::File,
 	io::{BufRead, BufReader},
 	path::Path,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
 use anyhow::{Context, Result};
@@ -38,6 +42,14 @@ pub fn run_index(claude_dir: &Path, force: bool) -> Result<()> {
 	// Resolve schema fields once.
 	let fields = SchemaFields::resolve(&schema)?;
 
+	// Set up Ctrl+C handler so we can commit partial progress.
+	let interrupted = Arc::new(AtomicBool::new(false));
+	let flag = Arc::clone(&interrupted);
+	ctrlc::set_handler(move || {
+		flag.store(true, Ordering::Relaxed);
+	})
+	.context("failed to set Ctrl+C handler")?;
+
 	let mut indexed_sessions: u64 = 0;
 	let mut indexed_messages: u64 = 0;
 	let mut skipped: u64 = 0;
@@ -47,6 +59,10 @@ pub fn run_index(claude_dir: &Path, force: bool) -> Result<()> {
 	let mut seen_files: HashSet<String> = HashSet::new();
 
 	for session in &sessions {
+		if interrupted.load(Ordering::Relaxed) {
+			eprintln!("\nInterrupted — committing progress so far...");
+			break;
+		}
 		let file_key = session.path.to_string_lossy().to_string();
 		seen_files.insert(file_key.clone());
 
@@ -78,20 +94,23 @@ pub fn run_index(claude_dir: &Path, force: bool) -> Result<()> {
 	}
 
 	// Remove documents for sessions that no longer exist on disk.
-	let stale_keys: Vec<String> = meta
-		.files
-		.keys()
-		.filter(|k| !seen_files.contains(k.as_str()))
-		.cloned()
-		.collect();
+	// Skip this step if interrupted — we only saw a partial set of files.
+	if !interrupted.load(Ordering::Relaxed) {
+		let stale_keys: Vec<String> = meta
+			.files
+			.keys()
+			.filter(|k| !seen_files.contains(k.as_str()))
+			.cloned()
+			.collect();
 
-	for key in &stale_keys {
-		// Extract session_id from the file path (stem of the .jsonl).
-		if let Some(session_id) = Path::new(key).file_stem().and_then(|s| s.to_str()) {
-			delete_session(&writer, &schema, session_id)?;
+		for key in &stale_keys {
+			// Extract session_id from the file path (stem of the .jsonl).
+			if let Some(session_id) = Path::new(key).file_stem().and_then(|s| s.to_str()) {
+				delete_session(&writer, &schema, session_id)?;
+			}
+			meta.files.remove(key);
+			removed += 1;
 		}
-		meta.files.remove(key);
-		removed += 1;
 	}
 
 	writer.commit().context("failed to commit index writer")?;
@@ -120,12 +139,15 @@ fn index_session_file(
 	let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
 	let reader = BufReader::new(file);
 	let mut count: u64 = 0;
+	let mut total_lines: u64 = 0;
+	let mut skipped_lines: u64 = 0;
 
 	for line_result in reader.lines() {
 		let line = match line_result {
 			Ok(l) => l,
-			Err(e) => {
-				eprintln!("warning: failed to read line from {}: {e}", path.display());
+			Err(_) => {
+				total_lines += 1;
+				skipped_lines += 1;
 				continue;
 			},
 		};
@@ -134,15 +156,13 @@ fn index_session_file(
 			continue;
 		}
 
+		total_lines += 1;
+
 		let parsed = match parse_line(&line, project_path, project_name) {
 			Ok(Some(msg)) => msg,
 			Ok(None) => continue,
-			Err(e) => {
-				eprintln!(
-					"warning: skipping malformed line in {} (session {}): {e}",
-					path.display(),
-					session_id,
-				);
+			Err(_) => {
+				skipped_lines += 1;
 				continue;
 			},
 		};
@@ -150,13 +170,7 @@ fn index_session_file(
 		// Parse the timestamp with chrono and convert to tantivy DateTime.
 		let tantivy_dt = match chrono::DateTime::parse_from_rfc3339(&parsed.timestamp) {
 			Ok(dt) => DateTime::from_timestamp_secs(dt.timestamp()),
-			Err(_) => {
-				eprintln!(
-					"warning: unparseable timestamp '{}' in session {}, using epoch",
-					parsed.timestamp, session_id,
-				);
-				DateTime::from_timestamp_secs(0)
-			},
+			Err(_) => DateTime::from_timestamp_secs(0),
 		};
 
 		let mut doc = TantivyDocument::new();
@@ -171,6 +185,17 @@ fn index_session_file(
 
 		writer.add_document(doc)?;
 		count += 1;
+	}
+
+	if skipped_lines > 0 && total_lines > 0 {
+		let skip_pct = (skipped_lines as f64 / total_lines as f64) * 100.0;
+		if skip_pct > 10.0 {
+			eprintln!(
+				"warning: {skipped_lines}/{total_lines} lines ({skip_pct:.0}%) skipped in {} \
+				 (session {session_id}) — file may be corrupt",
+				path.display(),
+			);
+		}
 	}
 
 	Ok(count)

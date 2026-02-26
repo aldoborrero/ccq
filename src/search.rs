@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 
 use anyhow::{Result, bail};
 use tantivy::{
@@ -77,7 +78,7 @@ fn get_field_date(doc: &TantivyDocument, schema: &Schema, field_name: &str) -> S
 		.unwrap_or_default()
 }
 
-pub fn run_search(opts: SearchOptions) -> Result<()> {
+pub fn run_search(opts: SearchOptions, writer: &mut dyn Write) -> Result<()> {
 	let dir = index_dir();
 	if !dir.exists() || !dir.join("meta.json").exists() {
 		bail!("No index found. Run `ccq index` first.");
@@ -133,16 +134,16 @@ pub fn run_search(opts: SearchOptions) -> Result<()> {
 
 	if hits.is_empty() {
 		if opts.json {
-			println!("[]");
+			writeln!(writer, "[]")?;
 		} else {
-			println!("No results found.");
+			writeln!(writer, "No results found.")?;
 		}
 		return Ok(());
 	}
 
 	if opts.json {
 		if opts.verbose {
-			println!("{}", serde_json::to_string_pretty(&hits)?);
+			writeln!(writer, "{}", serde_json::to_string_pretty(&hits)?)?;
 		} else {
 			let mut groups: BTreeMap<String, SessionGroupJson> = BTreeMap::new();
 			for hit in &hits {
@@ -170,7 +171,7 @@ pub fn run_search(opts: SearchOptions) -> Result<()> {
 					.partial_cmp(&a.best_score)
 					.unwrap_or(std::cmp::Ordering::Equal)
 			});
-			println!("{}", serde_json::to_string_pretty(&sorted)?);
+			writeln!(writer, "{}", serde_json::to_string_pretty(&sorted)?)?;
 		}
 		return Ok(());
 	}
@@ -188,9 +189,9 @@ pub fn run_search(opts: SearchOptions) -> Result<()> {
 		} else {
 			Vec::new()
 		};
-		print_verbose(&hits, &opts.query, &context_data);
+		print_verbose(&hits, &opts.query, &context_data, writer)?;
 	} else {
-		print_grouped(&hits);
+		print_grouped(&hits, writer)?;
 	}
 
 	Ok(())
@@ -463,8 +464,13 @@ fn fetch_context(
 	Ok(context_msgs)
 }
 
-fn print_verbose(hits: &[SearchHit], query: &str, context_data: &[Vec<(String, String, String)>]) {
-	println!("Found {} result(s):\n", theme::styled_bold(&hits.len().to_string()),);
+fn print_verbose(
+	hits: &[SearchHit],
+	query: &str,
+	context_data: &[Vec<(String, String, String)>],
+	writer: &mut dyn Write,
+) -> Result<()> {
+	writeln!(writer, "Found {} result(s):\n", theme::styled_bold(&hits.len().to_string()))?;
 	for (i, hit) in hits.iter().enumerate() {
 		let content_preview = extract_snippet(&hit.content, query, 80);
 
@@ -475,28 +481,29 @@ fn print_verbose(hits: &[SearchHit], query: &str, context_data: &[Vec<(String, S
 				.filter(|(ts, ..)| ts.as_str() <= hit.timestamp.as_str())
 				.collect();
 			if !before_msgs.is_empty() {
-				println!("  {}", theme::styled_dim("--- context ---"));
+				writeln!(writer, "  {}", theme::styled_dim("--- context ---"))?;
 				for (ts, role, content) in &before_msgs {
 					let truncated = truncate_content(content, 120);
-					println!(
+					writeln!(
+						writer,
 						"  {} {} [{}] {}",
 						theme::styled_dim(ts),
 						theme::styled_dim(role),
 						theme::styled_dim("ctx"),
 						theme::styled_dim(&truncated),
-					);
+					)?;
 				}
-				println!("  {}", theme::styled_dim("---"));
+				writeln!(writer, "  {}", theme::styled_dim("---"))?;
 			}
 		}
 
-		println!("  Score:     {}", theme::styled_score(&format!("{:.4}", hit.score)),);
-		println!("  Session:   {}", theme::styled_session_id(&hit.session_id));
-		println!("  Project:   {}", theme::styled_project(&hit.project_name));
-		println!("  Branch:    {}", theme::styled_branch(&hit.git_branch));
-		println!("  Role:      {}", theme::styled_role(&hit.role));
-		println!("  Timestamp: {}", hit.timestamp);
-		println!("  Content:   {}", content_preview);
+		writeln!(writer, "  Score:     {}", theme::styled_score(&format!("{:.4}", hit.score)))?;
+		writeln!(writer, "  Session:   {}", theme::styled_session_id(&hit.session_id))?;
+		writeln!(writer, "  Project:   {}", theme::styled_project(&hit.project_name))?;
+		writeln!(writer, "  Branch:    {}", theme::styled_branch(&hit.git_branch))?;
+		writeln!(writer, "  Role:      {}", theme::styled_role(&hit.role))?;
+		writeln!(writer, "  Timestamp: {}", hit.timestamp)?;
+		writeln!(writer, "  Content:   {}", content_preview)?;
 
 		// Print context messages after the hit (those with timestamp > hit timestamp).
 		if let Some(ctx) = context_data.get(i) {
@@ -505,23 +512,25 @@ fn print_verbose(hits: &[SearchHit], query: &str, context_data: &[Vec<(String, S
 				.filter(|(ts, ..)| ts.as_str() > hit.timestamp.as_str())
 				.collect();
 			if !after_msgs.is_empty() {
-				println!("  {}", theme::styled_dim("---"));
+				writeln!(writer, "  {}", theme::styled_dim("---"))?;
 				for (ts, role, content) in &after_msgs {
 					let truncated = truncate_content(content, 120);
-					println!(
+					writeln!(
+						writer,
 						"  {} {} [{}] {}",
 						theme::styled_dim(ts),
 						theme::styled_dim(role),
 						theme::styled_dim("ctx"),
 						theme::styled_dim(&truncated),
-					);
+					)?;
 				}
-				println!("  {}", theme::styled_dim("--- context ---"));
+				writeln!(writer, "  {}", theme::styled_dim("--- context ---"))?;
 			}
 		}
 
-		println!();
+		writeln!(writer)?;
 	}
+	Ok(())
 }
 
 /// Truncates content to the given max number of characters, appending "..." if
@@ -537,7 +546,7 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 	}
 }
 
-fn print_grouped(hits: &[SearchHit]) {
+fn print_grouped(hits: &[SearchHit], writer: &mut dyn Write) -> Result<()> {
 	// Group by session_id, keeping track of best score per session.
 	let mut groups: BTreeMap<String, SessionGroup> = BTreeMap::new();
 
@@ -569,25 +578,29 @@ fn print_grouped(hits: &[SearchHit]) {
 			.unwrap_or(std::cmp::Ordering::Equal)
 	});
 
-	println!(
+	writeln!(
+		writer,
 		"Found {} matching message(s) across {} session(s):\n",
 		theme::styled_bold(&hits.len().to_string()),
 		theme::styled_bold(&sorted.len().to_string()),
-	);
+	)?;
 	for (session_id, group) in &sorted {
-		println!(
+		writeln!(
+			writer,
 			"  {} session {} ({} hit(s))",
 			theme::styled_score(&format!("[{:.4}]", group.best_score)),
 			theme::styled_session_id(session_id),
 			theme::styled_bold(&group.message_count.to_string()),
-		);
-		println!(
+		)?;
+		writeln!(
+			writer,
 			"           project: {}  branch: {}  last: {}",
 			theme::styled_project(&group.project_name),
 			theme::styled_branch(&group.git_branch),
 			group.latest_timestamp,
-		);
+		)?;
 	}
+	Ok(())
 }
 
 struct SessionGroup {

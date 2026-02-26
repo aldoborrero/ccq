@@ -2,6 +2,7 @@ mod discovery;
 mod index;
 mod indexer;
 mod meta;
+mod pager;
 mod parser;
 mod search;
 mod sessions;
@@ -13,6 +14,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "ccq", about = "Search your Claude Code conversation history")]
 struct Cli {
+	/// Disable automatic pager
+	#[arg(long, global = true)]
+	no_pager: bool,
+
 	#[command(subcommand)]
 	command: Commands,
 }
@@ -64,6 +69,12 @@ enum Commands {
 		/// Output as JSON
 		#[arg(long)]
 		json: bool,
+		/// Show only the first N messages
+		#[arg(long, conflicts_with = "tail")]
+		head: Option<usize>,
+		/// Show only the last N messages
+		#[arg(long, conflicts_with = "head")]
+		tail: Option<usize>,
 	},
 	/// Show index statistics
 	Stats {
@@ -88,20 +99,25 @@ fn main() -> anyhow::Result<()> {
 			crate::indexer::run_index(&claude_dir, force)?;
 		},
 		Commands::Search { query, project, branch, after, before, verbose, json, limit, context } => {
-			crate::search::run_search(crate::search::SearchOptions {
-				query,
-				project,
-				branch,
-				after,
-				before,
-				verbose,
-				json,
-				limit,
-				context,
-			})?;
+			let mut pager = pager::Pager::new(cli.no_pager || json);
+			crate::search::run_search(
+				crate::search::SearchOptions {
+					query,
+					project,
+					branch,
+					after,
+					before,
+					verbose,
+					json,
+					limit,
+					context,
+				},
+				pager.writer(),
+			)?;
 		},
-		Commands::Sessions { session_id, project, json } => {
-			crate::sessions::run_sessions(session_id, project, json)?;
+		Commands::Sessions { session_id, project, json, head, tail } => {
+			let mut pager = pager::Pager::new(cli.no_pager || json);
+			crate::sessions::run_sessions(session_id, project, json, head, tail, pager.writer())?;
 		},
 		Commands::Stats { json } => {
 			crate::stats::run_stats(json)?;

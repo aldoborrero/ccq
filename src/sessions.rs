@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use tantivy::{
@@ -63,7 +64,14 @@ struct SessionInfo {
 /// Two modes:
 /// - No `session_id`: list all sessions grouped by session_id.
 /// - With `session_id`: show all messages for that session.
-pub fn run_sessions(session_id: Option<String>, project: Option<String>, json: bool) -> Result<()> {
+pub fn run_sessions(
+	session_id: Option<String>,
+	project: Option<String>,
+	json: bool,
+	head: Option<usize>,
+	tail: Option<usize>,
+	writer: &mut dyn Write,
+) -> Result<()> {
 	let dir = index_dir();
 	let index =
 		Index::open_in_dir(&dir).context("failed to open index — have you run `ccq index`?")?;
@@ -72,8 +80,8 @@ pub fn run_sessions(session_id: Option<String>, project: Option<String>, json: b
 	let searcher = reader.searcher();
 
 	match session_id {
-		None => list_sessions(&searcher, &schema, project, json),
-		Some(sid) => show_session(&searcher, &schema, &sid, json),
+		None => list_sessions(&searcher, &schema, project, json, writer),
+		Some(sid) => show_session(&searcher, &schema, &sid, json, head, tail, writer),
 	}
 }
 
@@ -101,6 +109,7 @@ fn list_sessions(
 	schema: &Schema,
 	project: Option<String>,
 	json: bool,
+	writer: &mut dyn Write,
 ) -> Result<()> {
 	let f_session_id = schema.get_field("session_id").unwrap();
 	let f_project_name = schema.get_field("project_name").unwrap();
@@ -168,9 +177,9 @@ fn list_sessions(
 
 	if sessions.is_empty() {
 		if json {
-			println!("[]");
+			writeln!(writer, "[]")?;
 		} else {
-			println!("No sessions found.");
+			writeln!(writer, "No sessions found.")?;
 		}
 		return Ok(());
 	}
@@ -197,7 +206,7 @@ fn list_sessions(
 				message_count: info.count,
 			})
 			.collect();
-		println!("{}", serde_json::to_string_pretty(&json_list)?);
+		writeln!(writer, "{}", serde_json::to_string_pretty(&json_list)?)?;
 		return Ok(());
 	}
 
@@ -219,17 +228,18 @@ fn list_sessions(
 			&info.session_id
 		};
 
-		println!(
+		writeln!(
+			writer,
 			"[{}] {}{} — {} — {} messages",
 			date_str,
 			theme::styled_project(&info.project_name),
 			branch_display,
 			theme::styled_session_id(sid_prefix),
 			theme::styled_bold(&info.count.to_string()),
-		);
+		)?;
 	}
 
-	println!("\nTotal: {} sessions", theme::styled_bold(&session_list.len().to_string()),);
+	writeln!(writer, "\nTotal: {} sessions", theme::styled_bold(&session_list.len().to_string()))?;
 
 	Ok(())
 }
@@ -289,6 +299,9 @@ fn show_session(
 	schema: &Schema,
 	session_id: &str,
 	json: bool,
+	head: Option<usize>,
+	tail: Option<usize>,
+	writer: &mut dyn Write,
 ) -> Result<()> {
 	let f_session_id = schema.get_field("session_id").unwrap();
 	let f_role = schema.get_field("role").unwrap();
@@ -308,9 +321,9 @@ fn show_session(
 
 	if results.is_empty() {
 		if json {
-			println!("[]");
+			writeln!(writer, "[]")?;
 		} else {
-			println!("No messages found for session: {full_sid}");
+			writeln!(writer, "No messages found for session: {full_sid}")?;
 		}
 		return Ok(());
 	}
@@ -333,6 +346,22 @@ fn show_session(
 		a_ts.cmp(&b_ts)
 	});
 
+	let total = messages.len();
+
+	// Apply head/tail slicing.
+	let range_note = if let Some(n) = head {
+		let n = n.min(total);
+		messages.truncate(n);
+		Some(format!("showing first {n}"))
+	} else if let Some(n) = tail {
+		let n = n.min(total);
+		let start = total.saturating_sub(n);
+		messages = messages.split_off(start);
+		Some(format!("showing last {n}"))
+	} else {
+		None
+	};
+
 	if json {
 		let json_messages: Vec<MessageJson> = messages
 			.iter()
@@ -345,24 +374,32 @@ fn show_session(
 				content: content.clone(),
 			})
 			.collect();
-		println!("{}", serde_json::to_string_pretty(&json_messages)?);
+		writeln!(writer, "{}", serde_json::to_string_pretty(&json_messages)?)?;
 		return Ok(());
 	}
 
-	println!("Session: {}", theme::styled_session_id(&full_sid));
-	println!("Messages: {}\n", theme::styled_bold(&messages.len().to_string()));
+	writeln!(writer, "Session: {}", theme::styled_session_id(&full_sid))?;
+	match range_note {
+		Some(note) => writeln!(
+			writer,
+			"Messages: {} ({})\n",
+			theme::styled_bold(&total.to_string()),
+			note,
+		)?,
+		None => writeln!(writer, "Messages: {}\n", theme::styled_bold(&total.to_string()))?,
+	}
 
 	for (ts, role, content) in &messages {
 		let ts_str = match ts {
 			Some(dt) => format_datetime(*dt),
 			None => "unknown".to_string(),
 		};
-		println!("[{}] {}:", theme::styled_score(&ts_str), theme::styled_role(role));
+		writeln!(writer, "[{}] {}:", theme::styled_score(&ts_str), theme::styled_role(role))?;
 		// Indent content lines.
 		for line in content.lines() {
-			println!("  {line}");
+			writeln!(writer, "  {line}")?;
 		}
-		println!();
+		writeln!(writer)?;
 	}
 
 	Ok(())

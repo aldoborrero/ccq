@@ -128,7 +128,8 @@ fn main() -> anyhow::Result<()> {
 			)?;
 		},
 		Commands::Stats { json } => {
-			crate::stats::run_stats(json)?;
+			let mut pager = pager::Pager::new(cli.no_pager || json);
+			crate::stats::run_stats(json, pager.writer())?;
 		},
 		Commands::Tui { query } => {
 			crate::tui::run_tui(query)?;

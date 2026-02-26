@@ -1,32 +1,27 @@
-use std::{collections::HashSet, fs, path::Path};
+use std::{collections::HashSet, fs, io::Write, path::Path};
 
 use anyhow::{Context, Result, bail};
-use tantivy::{
-	Index,
-	schema::TantivyDocument,
-};
+use tantivy::schema::TantivyDocument;
 
 use crate::{
-	doc::{self, SchemaFields},
-	index::{build_schema, index_dir},
+	doc,
+	index::{index_dir, IndexHandle},
 	meta::IndexMeta,
 	tui::theme,
 };
 
 /// Display statistics about the current index.
-pub fn run_stats(json: bool) -> Result<()> {
+pub fn run_stats(json: bool, writer: &mut dyn Write) -> Result<()> {
 	let idx_dir = index_dir();
 
 	if !idx_dir.exists() || !idx_dir.join("meta.json").exists() {
 		bail!("no index found at {}. Run `ccq index` first.", idx_dir.display(),);
 	}
 
-	let index = Index::open_in_dir(&idx_dir).context("failed to open tantivy index")?;
-	let schema = build_schema();
-	let reader = index.reader().context("failed to create index reader")?;
-	let searcher = reader.searcher();
+	let handle = IndexHandle::open()?;
+	let searcher = handle.searcher();
 
-	let fields = SchemaFields::resolve(&schema)?;
+	let fields = &handle.fields;
 
 	let mut projects: HashSet<String> = HashSet::new();
 	let mut sessions: HashSet<String> = HashSet::new();
@@ -86,35 +81,40 @@ pub fn run_stats(json: bool) -> Result<()> {
 			"index_size_human": format_bytes(size),
 			"last_updated": last_updated_str,
 		});
-		println!("{}", serde_json::to_string_pretty(&stats)?);
+		writeln!(writer, "{}", serde_json::to_string_pretty(&stats)?)?;
 		return Ok(());
 	}
 
-	println!(
+	writeln!(
+		writer,
 		"{} {}",
 		theme::styled_bold("Projects indexed:"),
 		theme::styled_project(&projects.len().to_string()),
-	);
-	println!(
+	)?;
+	writeln!(
+		writer,
 		"{} {}",
 		theme::styled_bold("Sessions indexed:"),
 		theme::styled_project(&sessions.len().to_string()),
-	);
-	println!(
+	)?;
+	writeln!(
+		writer,
 		"{} {}",
 		theme::styled_bold("Messages indexed:"),
 		theme::styled_project(&total_messages.to_string()),
-	);
-	println!(
+	)?;
+	writeln!(
+		writer,
 		"{} {}",
 		theme::styled_bold("Index size:      "),
 		theme::styled_project(&format_bytes(size)),
-	);
-	println!(
+	)?;
+	writeln!(
+		writer,
 		"{} {}",
 		theme::styled_bold("Last updated:    "),
 		theme::styled_project(&last_updated_str),
-	);
+	)?;
 
 	Ok(())
 }

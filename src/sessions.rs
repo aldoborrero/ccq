@@ -3,15 +3,15 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use tantivy::{
-	Index, Term,
-	collector::TopDocs,
-	query::{AllQuery, TermQuery},
-	schema::{IndexRecordOption, Schema},
+	Term,
+	collector::DocSetCollector,
+	query::TermQuery,
+	schema::{IndexRecordOption, TantivyDocument},
 };
 
 use crate::{
-	doc::{self, SchemaFields},
-	index::{build_schema, index_dir},
+	doc,
+	index::IndexHandle,
 	tui::theme,
 };
 
@@ -37,16 +37,11 @@ pub fn run_sessions(
 	tail: Option<usize>,
 	writer: &mut dyn Write,
 ) -> Result<()> {
-	let dir = index_dir();
-	let index =
-		Index::open_in_dir(&dir).context("failed to open index — have you run `ccq index`?")?;
-	let schema = build_schema();
-	let reader = index.reader().context("failed to open index reader")?;
-	let searcher = reader.searcher();
+	let handle = IndexHandle::open()?;
 
 	match session_id {
-		None => list_sessions(&searcher, &schema, project, json, writer),
-		Some(sid) => show_session(&searcher, &schema, &sid, json, head, tail, writer),
+		None => list_sessions(&handle, project, json, writer),
+		Some(sid) => show_session(&handle, &sid, json, head, tail, writer),
 	}
 }
 
@@ -69,71 +64,81 @@ struct MessageJson {
 }
 
 /// List all sessions, optionally filtered by project name.
+///
+/// Iterates over all segments directly instead of using a query with
+/// a large `TopDocs` limit.
 fn list_sessions(
-	searcher: &tantivy::Searcher,
-	schema: &Schema,
+	handle: &IndexHandle,
 	project: Option<String>,
 	json: bool,
 	writer: &mut dyn Write,
 ) -> Result<()> {
-	let fields = SchemaFields::resolve(schema)?;
-
-	let top_docs = TopDocs::with_limit(1_000_000);
-	let results = searcher
-		.search(&AllQuery, &top_docs)
-		.context("search failed")?;
+	let fields = &handle.fields;
+	let searcher = handle.searcher();
 
 	// Group documents by session_id.
 	let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
 
-	for (_score, doc_addr) in results {
-		let d: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
+	for segment_reader in searcher.segment_readers() {
+		let store_reader = segment_reader
+			.get_store_reader(64)
+			.context("failed to open segment store reader")?;
 
-		let sid = doc::get_text(&d, fields.session_id);
-		if sid.is_empty() {
-			continue;
-		}
-
-		let pname = doc::get_text(&d, fields.project_name);
-		let branch = doc::get_text(&d, fields.git_branch);
-		let ts = doc::get_datetime(&d, fields.timestamp);
-
-		// Apply project filter if provided.
-		if let Some(ref filter) = project
-			&& !pname.to_lowercase().contains(&filter.to_lowercase())
-		{
-			continue;
-		}
-
-		let entry = sessions.entry(sid.clone()).or_insert_with(|| SessionInfo {
-			session_id: sid,
-			project_name: pname.clone(),
-			git_branch: branch.clone(),
-			earliest: ts,
-			count: 0,
-		});
-
-		entry.count += 1;
-
-		// Track earliest timestamp.
-		if let Some(current_ts) = ts {
-			match entry.earliest {
-				Some(existing) if current_ts < existing => {
-					entry.earliest = Some(current_ts);
-				},
-				None => {
-					entry.earliest = Some(current_ts);
-				},
-				_ => {},
+		for doc_id in 0..segment_reader.max_doc() {
+			if segment_reader.is_deleted(doc_id) {
+				continue;
 			}
-		}
 
-		// Update project_name/branch if they were empty before.
-		if entry.project_name.is_empty() && !pname.is_empty() {
-			entry.project_name = pname;
-		}
-		if entry.git_branch.is_empty() && !branch.is_empty() {
-			entry.git_branch = branch;
+			let d: TantivyDocument = store_reader
+				.get(doc_id)
+				.context("failed to retrieve document from store")?;
+
+			let sid = doc::get_text(&d, fields.session_id);
+			if sid.is_empty() {
+				continue;
+			}
+
+			let pname = doc::get_text(&d, fields.project_name);
+			let branch = doc::get_text(&d, fields.git_branch);
+			let ts = doc::get_datetime(&d, fields.timestamp);
+
+			// Apply project filter if provided.
+			if let Some(ref filter) = project
+				&& !pname.to_lowercase().contains(&filter.to_lowercase())
+			{
+				continue;
+			}
+
+			let entry = sessions.entry(sid.clone()).or_insert_with(|| SessionInfo {
+				session_id: sid,
+				project_name: pname.clone(),
+				git_branch: branch.clone(),
+				earliest: ts,
+				count: 0,
+			});
+
+			entry.count += 1;
+
+			// Track earliest timestamp.
+			if let Some(current_ts) = ts {
+				match entry.earliest {
+					Some(existing) if current_ts < existing => {
+						entry.earliest = Some(current_ts);
+					},
+					None => {
+						entry.earliest = Some(current_ts);
+					},
+					_ => {},
+				}
+			}
+
+			// Update project_name/branch if they were empty before.
+			if entry.project_name.is_empty() && !pname.is_empty() {
+				entry.project_name = pname;
+			}
+			if entry.git_branch.is_empty() && !branch.is_empty() {
+				entry.git_branch = branch;
+			}
 		}
 	}
 
@@ -209,36 +214,45 @@ fn list_sessions(
 /// Resolve a (possibly prefix) session ID to the full session ID.
 ///
 /// If the given string matches a session_id exactly, return it.
-/// Otherwise scan all docs and find session IDs that start with the
-/// given prefix. If exactly one match is found, return it.
+/// Otherwise iterate over all segments and find session IDs that
+/// start with the given prefix. If exactly one match is found,
+/// return it.
 fn resolve_session_id(
-	searcher: &tantivy::Searcher,
-	schema: &Schema,
+	handle: &IndexHandle,
 	input: &str,
 ) -> Result<String> {
-	let fields = SchemaFields::resolve(schema)?;
+	let searcher = handle.searcher();
 
 	// First try an exact match.
-	let term = Term::from_field_text(fields.session_id, input);
+	let term = Term::from_field_text(handle.fields.session_id, input);
 	let query = TermQuery::new(term, IndexRecordOption::Basic);
 	let exact = searcher
-		.search(&query, &TopDocs::with_limit(1))
+		.search(&query, &DocSetCollector)
 		.context("search failed")?;
 	if !exact.is_empty() {
 		return Ok(input.to_string());
 	}
 
-	// Prefix search: scan all docs and collect matching session IDs.
-	let all_docs = searcher
-		.search(&AllQuery, &TopDocs::with_limit(1_000_000))
-		.context("search failed")?;
-
+	// Prefix search: iterate over all segments and collect matching session IDs.
 	let mut matches: HashMap<String, bool> = HashMap::new();
-	for (_score, doc_addr) in all_docs {
-		let d: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
-		let sid = doc::get_text(&d, fields.session_id);
-		if sid.starts_with(input) {
-			matches.insert(sid, true);
+	for segment_reader in searcher.segment_readers() {
+		let store_reader = segment_reader
+			.get_store_reader(64)
+			.context("failed to open segment store reader")?;
+
+		for doc_id in 0..segment_reader.max_doc() {
+			if segment_reader.is_deleted(doc_id) {
+				continue;
+			}
+
+			let d: TantivyDocument = store_reader
+				.get(doc_id)
+				.context("failed to retrieve document from store")?;
+
+			let sid = doc::get_text(&d, handle.fields.session_id);
+			if sid.starts_with(input) {
+				matches.insert(sid, true);
+			}
 		}
 	}
 
@@ -257,25 +271,24 @@ fn resolve_session_id(
 
 /// Show all messages for a specific session, sorted by timestamp.
 fn show_session(
-	searcher: &tantivy::Searcher,
-	schema: &Schema,
+	handle: &IndexHandle,
 	session_id: &str,
 	json: bool,
 	head: Option<usize>,
 	tail: Option<usize>,
 	writer: &mut dyn Write,
 ) -> Result<()> {
-	let fields = SchemaFields::resolve(schema)?;
+	let fields = &handle.fields;
+	let searcher = handle.searcher();
 
 	// Resolve prefix to full session ID.
-	let full_sid = resolve_session_id(searcher, schema, session_id)?;
+	let full_sid = resolve_session_id(handle, session_id)?;
 
 	let term = Term::from_field_text(fields.session_id, &full_sid);
 	let query = TermQuery::new(term, IndexRecordOption::Basic);
 
-	let top_docs = TopDocs::with_limit(1_000_000);
 	let results = searcher
-		.search(&query, &top_docs)
+		.search(&query, &DocSetCollector)
 		.context("search failed")?;
 
 	if results.is_empty() {
@@ -290,8 +303,8 @@ fn show_session(
 	// Collect all messages with their timestamps for sorting.
 	let mut messages: Vec<(Option<tantivy::DateTime>, String, String)> = Vec::new();
 
-	for (_score, doc_addr) in results {
-		let d: tantivy::TantivyDocument = searcher.doc(doc_addr)?;
+	for doc_addr in results {
+		let d: TantivyDocument = searcher.doc(doc_addr)?;
 		let role = doc::get_text(&d, fields.role);
 		let content = doc::get_text(&d, fields.content);
 		let ts = doc::get_datetime(&d, fields.timestamp);

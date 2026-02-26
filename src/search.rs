@@ -4,7 +4,7 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 use tantivy::{
 	TantivyDocument, Term,
-	collector::TopDocs,
+	collector::{DocSetCollector, TopDocs},
 	query::{QueryParser, TermQuery},
 	schema::IndexRecordOption,
 };
@@ -221,41 +221,53 @@ pub fn search_hits(handle: &IndexHandle, query: &str, limit: usize) -> Result<Ve
 
 /// Returns all sessions from the index.
 ///
-/// Scans the entire index using `AllQuery`, groups documents by `session_id`,
-/// and returns `(session_id, project_name, git_branch, latest_timestamp,
-/// message_count)` sorted by latest timestamp descending.
+/// Iterates over all segments directly (no query/collector needed),
+/// groups documents by `session_id`, and returns `(session_id,
+/// project_name, git_branch, latest_timestamp, message_count)` sorted
+/// by latest timestamp descending.
 pub fn all_sessions(handle: &IndexHandle) -> Result<Vec<SessionInfo>> {
 	let searcher = handle.searcher();
 
-	let top_docs = searcher.search(&tantivy::query::AllQuery, &TopDocs::with_limit(1_000_000))?;
-
 	let mut groups: BTreeMap<String, (String, String, String, usize)> = BTreeMap::new();
 
-	for (_score, doc_address) in top_docs {
-		let d: TantivyDocument = searcher.doc(doc_address)?;
-		let session_id = doc::get_text(&d, handle.fields.session_id);
-		if session_id.is_empty() {
-			continue;
-		}
-		let project_name = doc::get_text(&d, handle.fields.project_name);
-		let git_branch = doc::get_text(&d, handle.fields.git_branch);
-		let timestamp = doc::get_datetime(&d, handle.fields.timestamp)
-			.map(doc::format_datetime)
-			.unwrap_or_default();
+	for segment_reader in searcher.segment_readers() {
+		let store_reader = segment_reader
+			.get_store_reader(64)
+			.context("failed to open segment store reader")?;
 
-		let entry = groups
-			.entry(session_id)
-			.or_insert_with(|| (project_name.clone(), git_branch.clone(), String::new(), 0));
+		for doc_id in 0..segment_reader.max_doc() {
+			if segment_reader.is_deleted(doc_id) {
+				continue;
+			}
 
-		entry.3 += 1;
-		if timestamp > entry.2 {
-			entry.2 = timestamp;
-		}
-		if entry.0.is_empty() && !project_name.is_empty() {
-			entry.0 = project_name;
-		}
-		if entry.1.is_empty() && !git_branch.is_empty() {
-			entry.1 = git_branch;
+			let d: TantivyDocument = store_reader
+				.get(doc_id)
+				.context("failed to retrieve document from store")?;
+
+			let session_id = doc::get_text(&d, handle.fields.session_id);
+			if session_id.is_empty() {
+				continue;
+			}
+			let project_name = doc::get_text(&d, handle.fields.project_name);
+			let git_branch = doc::get_text(&d, handle.fields.git_branch);
+			let timestamp = doc::get_datetime(&d, handle.fields.timestamp)
+				.map(doc::format_datetime)
+				.unwrap_or_default();
+
+			let entry = groups
+				.entry(session_id)
+				.or_insert_with(|| (project_name.clone(), git_branch.clone(), String::new(), 0));
+
+			entry.3 += 1;
+			if timestamp > entry.2 {
+				entry.2 = timestamp;
+			}
+			if entry.0.is_empty() && !project_name.is_empty() {
+				entry.0 = project_name;
+			}
+			if entry.1.is_empty() && !git_branch.is_empty() {
+				entry.1 = git_branch;
+			}
 		}
 	}
 
@@ -272,8 +284,9 @@ pub fn all_sessions(handle: &IndexHandle) -> Result<Vec<SessionInfo>> {
 
 /// Returns all messages for a given session, sorted by timestamp ascending.
 ///
-/// Uses a `TermQuery` on the `session_id` field to find all documents
-/// belonging to the session and returns `(timestamp, role, content)` tuples.
+/// Uses a `TermQuery` on the `session_id` field with `DocSetCollector` to
+/// find all documents belonging to the session without an arbitrary limit.
+/// Returns `(timestamp, role, content)` tuples.
 pub fn session_messages(
 	handle: &IndexHandle,
 	session_id: &str,
@@ -283,10 +296,10 @@ pub fn session_messages(
 	let term = Term::from_field_text(handle.fields.session_id, session_id);
 	let term_query = TermQuery::new(term, IndexRecordOption::Basic);
 
-	let top_docs = searcher.search(&term_query, &TopDocs::with_limit(100_000))?;
+	let doc_addresses = searcher.search(&term_query, &DocSetCollector)?;
 
 	let mut messages = Vec::new();
-	for (_score, doc_address) in top_docs {
+	for doc_address in doc_addresses {
 		let d: TantivyDocument = searcher.doc(doc_address)?;
 		let timestamp = doc::get_datetime(&d, handle.fields.timestamp)
 			.map(doc::format_datetime)
@@ -397,11 +410,10 @@ fn fetch_context(
 	let term = Term::from_field_text(fields.session_id, session_id);
 	let term_query = TermQuery::new(term, IndexRecordOption::Basic);
 
-	// Collect all messages in this session (cap at a generous limit).
-	let top_docs = searcher.search(&term_query, &TopDocs::with_limit(10_000))?;
+	let doc_addresses = searcher.search(&term_query, &DocSetCollector)?;
 
 	let mut messages: Vec<(String, String, String)> = Vec::new();
-	for (_score, doc_address) in top_docs {
+	for doc_address in doc_addresses {
 		let d: TantivyDocument = searcher.doc(doc_address)?;
 		let ts = doc::get_datetime(&d, fields.timestamp)
 			.map(doc::format_datetime)

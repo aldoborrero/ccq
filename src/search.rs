@@ -1,17 +1,17 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tantivy::{
-	Index, TantivyDocument, Term,
+	TantivyDocument, Term,
 	collector::TopDocs,
 	query::{QueryParser, TermQuery},
-	schema::{IndexRecordOption, Schema},
+	schema::IndexRecordOption,
 };
 
 use crate::{
 	doc::{self, SchemaFields},
-	index::{build_schema, index_dir},
+	index::IndexHandle,
 	tui::theme,
 };
 
@@ -52,20 +52,30 @@ struct SessionGroupJson {
 	latest_timestamp: String,
 }
 
+/// Parse a user-provided date string (YYYY-MM-DD) into a chrono NaiveDate.
+fn parse_filter_date(s: &str, flag: &str) -> Result<chrono::NaiveDate> {
+	chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+		.with_context(|| format!("invalid date for {flag}: '{s}' (expected YYYY-MM-DD)"))
+}
+
+/// Extract the date portion of a formatted timestamp string.
+fn extract_date(timestamp: &str) -> Option<chrono::NaiveDate> {
+	timestamp
+		.get(..10)
+		.and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+}
+
 pub fn run_search(opts: SearchOptions, writer: &mut dyn Write) -> Result<()> {
-	let dir = index_dir();
-	if !dir.exists() || !dir.join("meta.json").exists() {
-		bail!("No index found. Run `ccq index` first.");
-	}
+	let handle = IndexHandle::open()?;
+	let searcher = handle.searcher();
 
-	let schema = build_schema();
-	let fields = SchemaFields::resolve(&schema)?;
-	let index = Index::open_in_dir(&dir)?;
-	let reader = index.reader()?;
-	let searcher = reader.searcher();
-
-	let query_parser = QueryParser::for_index(&index, vec![fields.content]);
-	let query = query_parser.parse_query(&opts.query)?;
+	let query_parser = QueryParser::for_index(&handle.index, vec![handle.fields.content]);
+	let query = match query_parser.parse_query(&opts.query) {
+		Ok(q) => q,
+		Err(e) => {
+			bail!("Invalid search query: {e}\nTry simpler terms or check for unmatched quotes/parentheses.");
+		},
+	};
 
 	let top_docs = searcher.search(&query, &TopDocs::with_limit(opts.limit))?;
 
@@ -75,14 +85,14 @@ pub fn run_search(opts: SearchOptions, writer: &mut dyn Write) -> Result<()> {
 
 		hits.push(SearchHit {
 			score,
-			session_id: doc::get_text(&d, fields.session_id),
-			project_name: doc::get_text(&d, fields.project_name),
-			git_branch: doc::get_text(&d, fields.git_branch),
-			role: doc::get_text(&d, fields.role),
-			timestamp: doc::get_datetime(&d, fields.timestamp)
+			session_id: doc::get_text(&d, handle.fields.session_id),
+			project_name: doc::get_text(&d, handle.fields.project_name),
+			git_branch: doc::get_text(&d, handle.fields.git_branch),
+			role: doc::get_text(&d, handle.fields.role),
+			timestamp: doc::get_datetime(&d, handle.fields.timestamp)
 				.map(doc::format_datetime)
 				.unwrap_or_default(),
-			content: doc::get_text(&d, fields.content),
+			content: doc::get_text(&d, handle.fields.content),
 		});
 	}
 
@@ -95,10 +105,12 @@ pub fn run_search(opts: SearchOptions, writer: &mut dyn Write) -> Result<()> {
 		hits.retain(|h| h.git_branch == *branch_filter);
 	}
 	if let Some(ref after) = opts.after {
-		hits.retain(|h| h.timestamp.as_str() >= after.as_str());
+		let after_date = parse_filter_date(after, "--after")?;
+		hits.retain(|h| extract_date(&h.timestamp).is_some_and(|d| d >= after_date));
 	}
 	if let Some(ref before) = opts.before {
-		hits.retain(|h| h.timestamp.as_str() <= before.as_str());
+		let before_date = parse_filter_date(before, "--before")?;
+		hits.retain(|h| extract_date(&h.timestamp).is_some_and(|d| d <= before_date));
 	}
 
 	if hits.is_empty() {
@@ -151,8 +163,15 @@ pub fn run_search(opts: SearchOptions, writer: &mut dyn Write) -> Result<()> {
 			hits
 				.iter()
 				.map(|hit| {
-					fetch_context(&searcher, &schema, &hit.session_id, &hit.timestamp, &hit.role, n)
-						.unwrap_or_default()
+					fetch_context(
+						&searcher,
+						&handle.fields,
+						&hit.session_id,
+						&hit.timestamp,
+						&hit.role,
+						n,
+					)
+					.unwrap_or_default()
 				})
 				.collect()
 		} else {
@@ -168,23 +187,16 @@ pub fn run_search(opts: SearchOptions, writer: &mut dyn Write) -> Result<()> {
 
 /// Searches the index and returns matching hits.
 ///
-/// Opens the index, builds a query parser on the `content` field,
-/// and returns up to `limit` results sorted by relevance score.
-/// Returns an empty Vec if the index directory does not exist.
-pub fn search_hits(query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-	let dir = index_dir();
-	if !dir.exists() || !dir.join("meta.json").exists() {
-		return Ok(Vec::new());
-	}
+/// Uses the provided `IndexHandle` to avoid reopening the index.
+/// Returns up to `limit` results sorted by relevance score.
+pub fn search_hits(handle: &IndexHandle, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+	let searcher = handle.searcher();
 
-	let schema = build_schema();
-	let fields = SchemaFields::resolve(&schema)?;
-	let index = Index::open_in_dir(&dir)?;
-	let reader = index.reader()?;
-	let searcher = reader.searcher();
-
-	let query_parser = QueryParser::for_index(&index, vec![fields.content]);
-	let parsed_query = query_parser.parse_query(query)?;
+	let query_parser = QueryParser::for_index(&handle.index, vec![handle.fields.content]);
+	let parsed_query = match query_parser.parse_query(query) {
+		Ok(q) => q,
+		Err(_) => return Ok(Vec::new()),
+	};
 
 	let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit))?;
 
@@ -193,14 +205,14 @@ pub fn search_hits(query: &str, limit: usize) -> Result<Vec<SearchHit>> {
 		let d: TantivyDocument = searcher.doc(doc_address)?;
 		hits.push(SearchHit {
 			score,
-			session_id: doc::get_text(&d, fields.session_id),
-			project_name: doc::get_text(&d, fields.project_name),
-			git_branch: doc::get_text(&d, fields.git_branch),
-			role: doc::get_text(&d, fields.role),
-			timestamp: doc::get_datetime(&d, fields.timestamp)
+			session_id: doc::get_text(&d, handle.fields.session_id),
+			project_name: doc::get_text(&d, handle.fields.project_name),
+			git_branch: doc::get_text(&d, handle.fields.git_branch),
+			role: doc::get_text(&d, handle.fields.role),
+			timestamp: doc::get_datetime(&d, handle.fields.timestamp)
 				.map(doc::format_datetime)
 				.unwrap_or_default(),
-			content: doc::get_text(&d, fields.content),
+			content: doc::get_text(&d, handle.fields.content),
 		});
 	}
 
@@ -212,17 +224,8 @@ pub fn search_hits(query: &str, limit: usize) -> Result<Vec<SearchHit>> {
 /// Scans the entire index using `AllQuery`, groups documents by `session_id`,
 /// and returns `(session_id, project_name, git_branch, latest_timestamp,
 /// message_count)` sorted by latest timestamp descending.
-pub fn all_sessions() -> Result<Vec<SessionInfo>> {
-	let dir = index_dir();
-	if !dir.exists() || !dir.join("meta.json").exists() {
-		return Ok(Vec::new());
-	}
-
-	let schema = build_schema();
-	let fields = SchemaFields::resolve(&schema)?;
-	let index = Index::open_in_dir(&dir)?;
-	let reader = index.reader()?;
-	let searcher = reader.searcher();
+pub fn all_sessions(handle: &IndexHandle) -> Result<Vec<SessionInfo>> {
+	let searcher = handle.searcher();
 
 	let top_docs = searcher.search(&tantivy::query::AllQuery, &TopDocs::with_limit(1_000_000))?;
 
@@ -230,13 +233,13 @@ pub fn all_sessions() -> Result<Vec<SessionInfo>> {
 
 	for (_score, doc_address) in top_docs {
 		let d: TantivyDocument = searcher.doc(doc_address)?;
-		let session_id = doc::get_text(&d, fields.session_id);
+		let session_id = doc::get_text(&d, handle.fields.session_id);
 		if session_id.is_empty() {
 			continue;
 		}
-		let project_name = doc::get_text(&d, fields.project_name);
-		let git_branch = doc::get_text(&d, fields.git_branch);
-		let timestamp = doc::get_datetime(&d, fields.timestamp)
+		let project_name = doc::get_text(&d, handle.fields.project_name);
+		let git_branch = doc::get_text(&d, handle.fields.git_branch);
+		let timestamp = doc::get_datetime(&d, handle.fields.timestamp)
 			.map(doc::format_datetime)
 			.unwrap_or_default();
 
@@ -271,19 +274,13 @@ pub fn all_sessions() -> Result<Vec<SessionInfo>> {
 ///
 /// Uses a `TermQuery` on the `session_id` field to find all documents
 /// belonging to the session and returns `(timestamp, role, content)` tuples.
-pub fn session_messages(session_id: &str) -> Result<Vec<(String, String, String)>> {
-	let dir = index_dir();
-	if !dir.exists() || !dir.join("meta.json").exists() {
-		return Ok(Vec::new());
-	}
+pub fn session_messages(
+	handle: &IndexHandle,
+	session_id: &str,
+) -> Result<Vec<(String, String, String)>> {
+	let searcher = handle.searcher();
 
-	let schema = build_schema();
-	let fields = SchemaFields::resolve(&schema)?;
-	let index = Index::open_in_dir(&dir)?;
-	let reader = index.reader()?;
-	let searcher = reader.searcher();
-
-	let term = Term::from_field_text(fields.session_id, session_id);
+	let term = Term::from_field_text(handle.fields.session_id, session_id);
 	let term_query = TermQuery::new(term, IndexRecordOption::Basic);
 
 	let top_docs = searcher.search(&term_query, &TopDocs::with_limit(100_000))?;
@@ -291,11 +288,11 @@ pub fn session_messages(session_id: &str) -> Result<Vec<(String, String, String)
 	let mut messages = Vec::new();
 	for (_score, doc_address) in top_docs {
 		let d: TantivyDocument = searcher.doc(doc_address)?;
-		let timestamp = doc::get_datetime(&d, fields.timestamp)
+		let timestamp = doc::get_datetime(&d, handle.fields.timestamp)
 			.map(doc::format_datetime)
 			.unwrap_or_default();
-		let role = doc::get_text(&d, fields.role);
-		let content = doc::get_text(&d, fields.content);
+		let role = doc::get_text(&d, handle.fields.role);
+		let content = doc::get_text(&d, handle.fields.content);
 		messages.push((timestamp, role, content));
 	}
 
@@ -391,13 +388,12 @@ fn extract_snippet(content: &str, query: &str, window: usize) -> String {
 /// immediately before and after the hit (up to `context_size` each).
 fn fetch_context(
 	searcher: &tantivy::Searcher,
-	schema: &Schema,
+	fields: &SchemaFields,
 	session_id: &str,
 	hit_timestamp: &str,
 	hit_role: &str,
 	context_size: usize,
 ) -> Result<Vec<(String, String, String)>> {
-	let fields = SchemaFields::resolve(schema)?;
 	let term = Term::from_field_text(fields.session_id, session_id);
 	let term_query = TermQuery::new(term, IndexRecordOption::Basic);
 

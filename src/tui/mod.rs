@@ -15,7 +15,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use self::app::{App, InputMode, MessageEntry, Pane, SessionEntry};
-use crate::search;
+use crate::{index::IndexHandle, search};
 
 pub fn run_tui(query: Option<String>) -> anyhow::Result<()> {
 	// Terminal setup
@@ -34,23 +34,26 @@ pub fn run_tui(query: Option<String>) -> anyhow::Result<()> {
 		original_hook(panic_info);
 	}));
 
+	// Open the index once for the lifetime of the TUI.
+	let handle = IndexHandle::open()?;
+
 	// Create app state
 	let mut app = App::new(query);
 
 	// If there's an initial query, execute the search
 	if !app.query.is_empty() {
-		execute_search(&mut app)?;
+		execute_search(&handle, &mut app)?;
 	} else {
-		load_all_sessions(&mut app)?;
+		load_all_sessions(&handle, &mut app)?;
 	}
 
 	// Load messages for the initially selected session
 	if !app.sessions.is_empty() {
-		let _ = load_session_messages(&mut app);
+		let _ = load_session_messages(&handle, &mut app);
 	}
 
 	// Main loop
-	let result = run_event_loop(&mut terminal, &mut app);
+	let result = run_event_loop(&handle, &mut terminal, &mut app);
 
 	// Terminal teardown
 	disable_raw_mode()?;
@@ -61,6 +64,7 @@ pub fn run_tui(query: Option<String>) -> anyhow::Result<()> {
 }
 
 fn run_event_loop(
+	handle: &IndexHandle,
 	terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 	app: &mut App,
 ) -> anyhow::Result<()> {
@@ -90,11 +94,11 @@ fn run_event_loop(
 			if app.input_mode == InputMode::Normal && key.modifiers.contains(KeyModifiers::CONTROL) {
 				match key.code {
 					KeyCode::Char('d') => {
-						page_down(app);
+						page_down(handle, app);
 						continue;
 					},
 					KeyCode::Char('u') => {
-						page_up(app);
+						page_up(handle, app);
 						continue;
 					},
 					_ => {},
@@ -102,11 +106,11 @@ fn run_event_loop(
 			}
 
 			match app.input_mode {
-				InputMode::Normal => handle_normal_key(app, key.code)?,
-				InputMode::Search => handle_search_key(app, key.code)?,
+				InputMode::Normal => handle_normal_key(handle, app, key.code)?,
+				InputMode::Search => handle_search_key(handle, app, key.code)?,
 				InputMode::FilterMessages => handle_filter_messages_key(app, key.code),
 				InputMode::FilterProject | InputMode::FilterBranch => {
-					handle_filter_key(app, key.code)?;
+					handle_filter_key(handle, app, key.code)?;
 				},
 				InputMode::Help => {
 					// Any key dismisses help
@@ -119,9 +123,9 @@ fn run_event_loop(
 		if app.search_dirty && app.last_keystroke.elapsed() > std::time::Duration::from_millis(300) {
 			app.query = app.search_input.clone();
 			if app.query.is_empty() {
-				load_all_sessions(app)?;
+				load_all_sessions(handle, app)?;
 			} else {
-				execute_search(app)?;
+				execute_search(handle, app)?;
 			}
 			app.search_dirty = false;
 		}
@@ -129,7 +133,7 @@ fn run_event_loop(
 	Ok(())
 }
 
-fn handle_normal_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
+fn handle_normal_key(handle: &IndexHandle, app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 	match code {
 		KeyCode::Char('q') => {
 			app.running = false;
@@ -144,16 +148,16 @@ fn handle_normal_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 			}
 		},
 		KeyCode::Char('j') | KeyCode::Down => {
-			navigate_down(app);
+			navigate_down(handle, app);
 		},
 		KeyCode::Char('k') | KeyCode::Up => {
-			navigate_up(app);
+			navigate_up(handle, app);
 		},
 		KeyCode::PageDown => {
-			page_down(app);
+			page_down(handle, app);
 		},
 		KeyCode::PageUp => {
-			page_up(app);
+			page_up(handle, app);
 		},
 		KeyCode::Tab => {
 			app.active_pane = match app.active_pane {
@@ -170,7 +174,7 @@ fn handle_normal_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 			};
 		},
 		KeyCode::Enter => {
-			handle_enter(app)?;
+			handle_enter(handle, app)?;
 		},
 		KeyCode::Char('g') if app.active_pane == Pane::Preview => {
 			app.preview_scroll = 0;
@@ -226,16 +230,16 @@ fn handle_normal_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn handle_search_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
+fn handle_search_key(handle: &IndexHandle, app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 	match code {
 		KeyCode::Enter => {
 			app.query = app.search_input.clone();
 			app.input_mode = InputMode::Normal;
 			app.search_dirty = false;
 			if app.query.is_empty() {
-				load_all_sessions(app)?;
+				load_all_sessions(handle, app)?;
 			} else {
-				execute_search(app)?;
+				execute_search(handle, app)?;
 			}
 		},
 		KeyCode::Esc => {
@@ -309,12 +313,12 @@ fn apply_message_filter(app: &mut App) {
 	app.preview_scroll = 0;
 }
 
-fn navigate_down(app: &mut App) {
+fn navigate_down(handle: &IndexHandle, app: &mut App) {
 	match app.active_pane {
 		Pane::Sessions => {
 			if !app.sessions.is_empty() && app.session_index < app.sessions.len() - 1 {
 				app.session_index += 1;
-				let _ = load_session_messages(app);
+				let _ = load_session_messages(handle, app);
 			}
 		},
 		Pane::Messages => {
@@ -329,12 +333,12 @@ fn navigate_down(app: &mut App) {
 	}
 }
 
-fn navigate_up(app: &mut App) {
+fn navigate_up(handle: &IndexHandle, app: &mut App) {
 	match app.active_pane {
 		Pane::Sessions => {
 			if app.session_index > 0 {
 				app.session_index = app.session_index.saturating_sub(1);
-				let _ = load_session_messages(app);
+				let _ = load_session_messages(handle, app);
 			}
 		},
 		Pane::Messages => {
@@ -349,13 +353,13 @@ fn navigate_up(app: &mut App) {
 	}
 }
 
-fn page_down(app: &mut App) {
+fn page_down(handle: &IndexHandle, app: &mut App) {
 	let half = (app.visible_rows / 2).max(1) as usize;
 	match app.active_pane {
 		Pane::Sessions => {
 			if !app.sessions.is_empty() {
 				app.session_index = (app.session_index + half).min(app.sessions.len() - 1);
-				let _ = load_session_messages(app);
+				let _ = load_session_messages(handle, app);
 			}
 		},
 		Pane::Messages => {
@@ -370,12 +374,12 @@ fn page_down(app: &mut App) {
 	}
 }
 
-fn page_up(app: &mut App) {
+fn page_up(handle: &IndexHandle, app: &mut App) {
 	let half = (app.visible_rows / 2).max(1) as usize;
 	match app.active_pane {
 		Pane::Sessions => {
 			app.session_index = app.session_index.saturating_sub(half);
-			let _ = load_session_messages(app);
+			let _ = load_session_messages(handle, app);
 		},
 		Pane::Messages => {
 			app.message_index = app.message_index.saturating_sub(half);
@@ -387,11 +391,11 @@ fn page_up(app: &mut App) {
 	}
 }
 
-fn handle_enter(app: &mut App) -> anyhow::Result<()> {
+fn handle_enter(handle: &IndexHandle, app: &mut App) -> anyhow::Result<()> {
 	match app.active_pane {
 		Pane::Sessions => {
 			if app.selected_session().is_some() {
-				load_session_messages(app)?;
+				load_session_messages(handle, app)?;
 				app.active_pane = Pane::Messages;
 				app.message_index = 0;
 				app.preview_scroll = 0;
@@ -409,8 +413,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 	ui::draw(f, app);
 }
 
-fn execute_search(app: &mut App) -> anyhow::Result<()> {
-	let hits = search::search_hits(&app.query, 200)?;
+fn execute_search(handle: &IndexHandle, app: &mut App) -> anyhow::Result<()> {
+	let hits = search::search_hits(handle, &app.query, 200)?;
 
 	// Collect hit timestamps per session for marking matched messages.
 	let mut hit_timestamps: HashMap<String, Vec<String>> = HashMap::new();
@@ -461,8 +465,8 @@ fn execute_search(app: &mut App) -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn load_all_sessions(app: &mut App) -> anyhow::Result<()> {
-	let all = search::all_sessions()?;
+fn load_all_sessions(handle: &IndexHandle, app: &mut App) -> anyhow::Result<()> {
+	let all = search::all_sessions(handle)?;
 	app.sessions = all
 		.into_iter()
 		.map(|(sid, pname, branch, ts, count)| SessionEntry {
@@ -485,7 +489,7 @@ fn load_all_sessions(app: &mut App) -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn handle_filter_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
+fn handle_filter_key(handle: &IndexHandle, app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 	let list_len = match app.input_mode {
 		InputMode::FilterProject => app.available_projects.len(),
 		InputMode::FilterBranch => app.available_branches.len(),
@@ -518,7 +522,7 @@ fn handle_filter_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 				_ => {},
 			}
 			app.input_mode = InputMode::Normal;
-			apply_filters(app)?;
+			apply_filters(handle, app)?;
 		},
 		KeyCode::Char('d') => {
 			match app.input_mode {
@@ -527,7 +531,7 @@ fn handle_filter_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 				_ => {},
 			}
 			app.input_mode = InputMode::Normal;
-			apply_filters(app)?;
+			apply_filters(handle, app)?;
 		},
 		KeyCode::Esc => {
 			app.input_mode = InputMode::Normal;
@@ -537,12 +541,12 @@ fn handle_filter_key(app: &mut App, code: KeyCode) -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn apply_filters(app: &mut App) -> anyhow::Result<()> {
+fn apply_filters(handle: &IndexHandle, app: &mut App) -> anyhow::Result<()> {
 	// Re-load base data
 	if app.query.is_empty() {
-		load_all_sessions(app)?;
+		load_all_sessions(handle, app)?;
 	} else {
-		execute_search(app)?;
+		execute_search(handle, app)?;
 	}
 
 	// Apply project filter
@@ -624,13 +628,13 @@ fn copy_to_clipboard(text: &str) {
 	let _ = execute!(io::stdout(), crossterm::style::Print(format!("\x1b]52;c;{encoded}\x07")));
 }
 
-fn load_session_messages(app: &mut App) -> anyhow::Result<()> {
+fn load_session_messages(handle: &IndexHandle, app: &mut App) -> anyhow::Result<()> {
 	let session_id = match app.selected_session() {
 		Some(s) => s.session_id.clone(),
 		None => return Ok(()),
 	};
 	let hit_ts = app.hit_timestamps.get(&session_id);
-	let msgs = search::session_messages(&session_id)?;
+	let msgs = search::session_messages(handle, &session_id)?;
 	app.messages = msgs
 		.into_iter()
 		.map(|(ts, role, content)| {

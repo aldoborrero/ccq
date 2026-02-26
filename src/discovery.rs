@@ -104,6 +104,13 @@ pub fn resolve_project_path(project_dir: &Path, encoded_name: &str) -> String {
 	{
 		return original;
 	}
+	// Fallback: lossy decode that splits on dashes. Projects with dashes in
+	// their directory names (e.g. "l2-deployer") will be decoded incorrectly.
+	if encoded_name.chars().filter(|&c| c == '-').count() > 4 {
+		eprintln!(
+			"warning: no sessions-index.json for '{encoded_name}', project path may be inaccurate"
+		);
+	}
 	decode_project_path(encoded_name)
 }
 

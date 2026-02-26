@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tantivy::{
-	Index, IndexWriter, Term,
+	Index, IndexReader, IndexWriter, Term,
 	schema::{INDEXED, STORED, STRING, Schema, SchemaBuilder, TEXT},
 };
+
+use crate::doc::SchemaFields;
 
 /// Returns the directory path for the tantivy index.
 ///
@@ -58,6 +60,34 @@ pub fn open_or_create_index(force: bool) -> Result<Index> {
 		Index::create_in_dir(&dir, schema).context("failed to create tantivy index in directory")
 	} else {
 		Index::open_in_dir(&dir).context("failed to open tantivy index from directory")
+	}
+}
+
+/// Cached handle for reading from the index.
+///
+/// Avoids repeated index opens, schema builds, and field resolution
+/// when multiple queries are issued (e.g. in the TUI).
+pub struct IndexHandle {
+	pub fields: SchemaFields,
+	pub index: Index,
+	pub reader: IndexReader,
+}
+
+impl IndexHandle {
+	pub fn open() -> Result<Self> {
+		let dir = index_dir();
+		if !dir.exists() || !dir.join("meta.json").exists() {
+			bail!("No index found. Run `ccq index` first.");
+		}
+		let schema = build_schema();
+		let fields = SchemaFields::resolve(&schema)?;
+		let index = Index::open_in_dir(&dir).context("failed to open index")?;
+		let reader = index.reader().context("failed to create index reader")?;
+		Ok(Self { fields, index, reader })
+	}
+
+	pub fn searcher(&self) -> tantivy::Searcher {
+		self.reader.searcher()
 	}
 }
 

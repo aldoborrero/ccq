@@ -599,7 +599,7 @@ fn find_session_file(session_id: &str) -> anyhow::Result<std::path::PathBuf> {
 		let entry = entry?;
 		if entry.file_type()?.is_dir() {
 			let candidate = entry.path().join(&filename);
-			if candidate.exists() {
+			if candidate.is_file() {
 				return Ok(candidate);
 			}
 		}

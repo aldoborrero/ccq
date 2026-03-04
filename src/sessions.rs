@@ -258,7 +258,7 @@ fn resolve_session_id(
 
 	match matches.len() {
 		0 => anyhow::bail!("no session found matching: {input}"),
-		1 => Ok(matches.into_keys().next().unwrap()),
+		1 => Ok(matches.into_keys().next().expect("guaranteed by len() == 1 check")),
 		n => {
 			let ids: Vec<String> = matches.into_keys().collect();
 			anyhow::bail!(

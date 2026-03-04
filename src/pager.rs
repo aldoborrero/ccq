@@ -34,10 +34,20 @@ impl Pager {
 		match cmd.spawn()
 		{
 			Ok(mut child) => {
-				let stdin = child.stdin.take().expect("failed to open pager stdin");
-				Self {
-					child: Some(child),
-					writer: Box::new(stdin),
+				match child.stdin.take() {
+					Some(stdin) => Self {
+						child: Some(child),
+						writer: Box::new(stdin),
+					},
+					None => {
+						// Pager has no stdin — kill it and fall back to stdout.
+						let _ = child.kill();
+						let _ = child.wait();
+						Self {
+							child: None,
+							writer: Box::new(io::stdout()),
+						}
+					},
 				}
 			}
 			Err(_) => {
